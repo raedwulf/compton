@@ -3243,6 +3243,7 @@ win_update_focused(session_t *ps, win *w) {
         || (ps->o.mark_wmwin_focused && w->wmwin)
         || (ps->o.mark_ovredir_focused
           && w->id == w->client_win && !w->wmwin)
+        || win_is_fullscreen(ps, w))
         || win_match(ps, w, ps->o.focus_blacklist, &w->cache_fcblst))
       w->focused = true;
 
