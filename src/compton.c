@@ -848,7 +848,7 @@ get_root_tile(session_t *ps) {
   if (fill) {
     XRenderColor  c;
 
-    c.red = c.green = c.blue = 0x8080;
+    c.red = c.green = c.blue = 0x0000;
     c.alpha = 0xffff;
     XRenderFillRectangle(ps->dpy, PictOpSrc, ps->root_tile_paint.pict, &c, 0, 0, 1, 1);
   }
