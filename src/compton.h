@@ -325,6 +325,14 @@ ms_to_tv(int timeout) {
 }
 
 /**
+ * Whether an event is DamageNotify.
+ */
+static inline bool
+isdamagenotify(session_t *ps, const XEvent *ev) {
+  return ps->damage_event + XDamageNotify == ev->type;
+}
+
+/**
  * Create a XTextProperty of a single string.
  */
 static inline XTextProperty *
@@ -468,9 +476,10 @@ win_has_frame(const win *w) {
 }
 
 static inline void
-wid_set_opacity_prop(session_t *ps, Window wid, long val) {
+wid_set_opacity_prop(session_t *ps, Window wid, opacity_t val) {
+  const unsigned long v = val;
   XChangeProperty(ps->dpy, wid, ps->atom_opacity, XA_CARDINAL, 32,
-      PropModeReplace, (unsigned char *) &val, 1);
+      PropModeReplace, (unsigned char *) &v, 1);
 }
 
 static inline void
@@ -555,6 +564,20 @@ clear_cache_win_leaders(session_t *ps) {
 static win *
 find_toplevel2(session_t *ps, Window wid);
 
+/**
+ * Find matched window.
+ */
+static inline win *
+find_win_all(session_t *ps, const Window wid) {
+  if (!wid || PointerRoot == wid || wid == ps->root || wid == ps->overlay)
+    return NULL;
+
+  win *w = find_win(ps, wid);
+  if (!w) w = find_toplevel(ps, wid);
+  if (!w) w = find_toplevel2(ps, wid);
+  return w;
+}
+
 static Window
 win_get_leader_raw(session_t *ps, win *w, int recursions);
 
@@ -581,7 +604,7 @@ group_is_focused(session_t *ps, Window leader) {
 
   for (win *w = ps->list; w; w = w->next) {
     if (win_get_leader(ps, w) == leader && !w->destroyed
-        && w->focused_real)
+        && win_is_focused_real(ps, w))
       return true;
   }
 
@@ -757,6 +780,9 @@ static inline void
 win_set_focused(session_t *ps, win *w, bool focused);
 
 static void
+win_on_focus_change(session_t *ps, win *w);
+
+static void
 win_determine_fade(session_t *ps, win *w);
 
 static void
@@ -794,6 +820,9 @@ calc_win_size(session_t *ps, win *w);
 
 static void
 calc_shadow_geometry(session_t *ps, win *w);
+
+static void
+win_upd_wintype(session_t *ps, win *w);
 
 static void
 win_mark_client(session_t *ps, win *w, Window client);
@@ -1204,6 +1233,9 @@ timeout_get_poll_time(session_t *ps);
 
 static void
 timeout_clear(session_t *ps);
+
+static bool
+tmout_unredir_callback(session_t *ps, timeout_t *tmout);
 
 static bool
 mainloop(session_t *ps);
