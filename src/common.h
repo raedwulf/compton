@@ -60,6 +60,10 @@
 #error Cannot enable c2 debugging without c2 support.
 #endif
 
+#ifndef COMPTON_VERSION
+#define COMPTON_VERSION "unknown"
+#endif
+
 // === Includes ===
 
 // For some special functions
@@ -131,6 +135,12 @@
 
 #define MSTR_(s)        #s
 #define MSTR(s)         MSTR_(s)
+
+/// @brief Wrapper for gcc branch prediction builtin, for likely branch.
+#define likely(x)    __builtin_expect(!!(x), 1)
+
+/// @brief Wrapper for gcc branch prediction builtin, for unlikely branch.
+#define unlikely(x)  __builtin_expect(!!(x), 0)
 
 /// Print out an error message.
 #define printf_err(format, ...) \
@@ -313,6 +323,7 @@ typedef enum {
 enum backend {
   BKEND_XRENDER,
   BKEND_GLX,
+  BKEND_XR_GLX_HYBRID,
   NUM_BKEND,
 };
 
@@ -431,9 +442,13 @@ typedef struct {
   // === General ===
   /// The configuration file we used.
   char *config_file;
+  /// Path to write PID to.
+  char *write_pid_path;
   /// The display name we used. NULL means we are using the value of the
   /// <code>DISPLAY</code> environment variable.
   char *display;
+  /// Safe representation of display name.
+  char *display_repr;
   /// The backend in use.
   enum backend backend;
   /// Whether to avoid using stencil buffer under GLX backend. Might be
@@ -498,6 +513,9 @@ typedef struct {
   bool dbe;
   /// Whether to do VSync aggressively.
   bool vsync_aggressive;
+  /// Whether to use glFinish() instead of glFlush() for (possibly) better
+  /// VSync yet probably higher CPU usage.
+  bool vsync_use_glfinish;
 
   // === Shadow ===
   /// Enable/disable shadow for specific window types.
@@ -631,7 +649,7 @@ typedef struct {
   /// A Picture acting as the painting target.
   Picture tgt_picture;
   /// Temporary buffer to paint to before sending to display.
-  Picture tgt_buffer;
+  paint_t tgt_buffer;
   /// DBE back buffer for root window. Used in DBE painting mode.
   XdbeBackBuffer root_dbe;
   /// Window ID of the window we register as a symbol.
@@ -986,7 +1004,7 @@ typedef struct _win {
   /// _NET_WM_OPACITY value
   opacity_t opacity_prop_client;
   /// Last window opacity value we set.
-  long opacity_set;
+  opacity_t opacity_set;
 
   // Fading-related members
   /// Do not fade if it's false. Change on window type change.
@@ -1150,6 +1168,15 @@ allocchk_(const char *func_name, void *ptr) {
 /// @brief Wrapper of allocchk_().
 #define allocchk(ptr) allocchk_(__func__, ptr)
 
+/// @brief Wrapper of malloc().
+#define cmalloc(nmemb, type) ((type *) allocchk(malloc((nmemb) * sizeof(type))))
+
+/// @brief Wrapper of calloc().
+#define ccalloc(nmemb, type) ((type *) allocchk(calloc((nmemb), sizeof(type))))
+
+/// @brief Wrapper of ealloc().
+#define crealloc(ptr, nmemb, type) ((type *) allocchk(realloc((ptr), (nmemb) * sizeof(type))))
+
 /**
  * Return whether a struct timeval value is empty.
  */
@@ -1310,10 +1337,7 @@ print_timestamp(session_t *ps) {
  */
 static inline char *
 mstrcpy(const char *src) {
-  char *str = malloc(sizeof(char) * (strlen(src) + 1));
-
-  if (!str)
-    printf_errfq(1, "(): Failed to allocate memory.");
+  char *str = cmalloc(strlen(src) + 1, char);
 
   strcpy(str, src);
 
@@ -1325,10 +1349,7 @@ mstrcpy(const char *src) {
  */
 static inline char *
 mstrncpy(const char *src, unsigned len) {
-  char *str = malloc(sizeof(char) * (len + 1));
-
-  if (!str)
-    printf_errfq(1, "(): Failed to allocate memory.");
+  char *str = cmalloc(len + 1, char);
 
   strncpy(str, src, len);
   str[len] = '\0';
@@ -1341,7 +1362,7 @@ mstrncpy(const char *src, unsigned len) {
  */
 static inline char *
 mstrjoin(const char *src1, const char *src2) {
-  char *str = malloc(sizeof(char) * (strlen(src1) + strlen(src2) + 1));
+  char *str = cmalloc(strlen(src1) + strlen(src2) + 1, char);
 
   strcpy(str, src1);
   strcat(str, src2);
@@ -1354,8 +1375,8 @@ mstrjoin(const char *src1, const char *src2) {
  */
 static inline char *
 mstrjoin3(const char *src1, const char *src2, const char *src3) {
-  char *str = malloc(sizeof(char) * (strlen(src1) + strlen(src2)
-        + strlen(src3) + 1));
+  char *str = cmalloc(strlen(src1) + strlen(src2)
+        + strlen(src3) + 1, char);
 
   strcpy(str, src1);
   strcat(str, src2);
@@ -1369,7 +1390,8 @@ mstrjoin3(const char *src1, const char *src2, const char *src3) {
  */
 static inline void
 mstrextend(char **psrc1, const char *src2) {
-  *psrc1 = realloc(*psrc1, (*psrc1 ? strlen(*psrc1): 0) + strlen(src2) + 1);
+  *psrc1 = crealloc(*psrc1, (*psrc1 ? strlen(*psrc1): 0) + strlen(src2) + 1,
+      char);
 
   strcat(*psrc1, src2);
 }
@@ -1472,6 +1494,11 @@ parse_backend(session_t *ps, const char *str) {
       ps->o.backend = i;
       return true;
     }
+  // Keep compatibility with an old revision containing a spelling mistake...
+  if (!strcasecmp(str, "xr_glx_hybird")) {
+    ps->o.backend = BKEND_XR_GLX_HYBRID;
+    return true;
+  }
   printf_errf("(\"%s\"): Invalid backend argument.", str);
   return false;
 }
@@ -1692,6 +1719,25 @@ find_toplevel(session_t *ps, Window id) {
   }
 
   return NULL;
+}
+
+
+/**
+ * Check if current backend uses XRender for rendering.
+ */
+static inline bool
+bkend_use_xrender(session_t *ps) {
+  return BKEND_XRENDER == ps->o.backend
+    || BKEND_XR_GLX_HYBRID == ps->o.backend;
+}
+
+/**
+ * Check if current backend uses GLX.
+ */
+static inline bool
+bkend_use_glx(session_t *ps) {
+  return BKEND_GLX == ps->o.backend
+    || BKEND_XR_GLX_HYBRID == ps->o.backend;
 }
 
 /**
@@ -2008,7 +2054,7 @@ free_texture(session_t *ps, glx_texture_t **pptex) {
 static inline void
 glx_mark_(session_t *ps, const char *func, XID xid, bool start) {
 #ifdef DEBUG_GLX_MARK
-  if (BKEND_GLX == ps->o.backend && ps->glStringMarkerGREMEDY) {
+  if (bkend_use_glx(ps) && ps->glStringMarkerGREMEDY) {
     if (!func) func = "(unknown)";
     const char *postfix = (start ? " (start)": " (end)");
     char *str = malloc((strlen(func) + 12 + 2
@@ -2029,7 +2075,7 @@ glx_mark_(session_t *ps, const char *func, XID xid, bool start) {
 static inline void
 glx_mark_frame(session_t *ps) {
 #ifdef DEBUG_GLX_MARK
-  if (BKEND_GLX == ps->o.backend && ps->glFrameTerminatorGREMEDY)
+  if (bkend_use_glx(ps) && ps->glFrameTerminatorGREMEDY)
     ps->glFrameTerminatorGREMEDY();
 #endif
 }
